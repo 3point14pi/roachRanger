@@ -5,13 +5,12 @@ from model_utils import load_yolo_model
 import os
 import shutil
 
-yolo_model = load_yolo_model()
-
 IMAGE_ADDRESS = "https://i.ytimg.com/vi/bEwCA_nrY5Q/hq720.jpg?sqp=-oaymwEhCK4FEIIDSFryq4qpAxMIARUAAAAAGAElAADIQj0AgKJD&rs=AOn4CLB4y6YJGxw6oVxFm-Uucbrjfqhu2Q"
 IMAGE_NAME = "uploaded.png"
 PRED_IMAGE_PATH = "runs/detect/predict/uploaded.png"
 DIRECTORY = "runs/detect/predict"
 PRED_MOVE_NAME = "pred_image.png"
+yolo_model = load_yolo_model()
 
 def make_predictions(IMAGE_PATH):
   results = yolo_model.predict(IMAGE_PATH, save=True, conf=0.75)
