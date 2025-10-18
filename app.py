@@ -1,44 +1,64 @@
-import av
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
-from model_utils import load_yolo_model  # your loader
+from PIL import Image
+import numpy as np
+from model_utils import load_yolo_model
+import os
+import shutil
 
-@st.cache_resource
-def get_model():
-    model = load_yolo_model()
-    # (optional) model.fuse(); model.to("cuda"); model.half()
-    return model
 
-class YOLOTransformer(VideoTransformerBase):
-    def __init__(self):
-        self.model = get_model()
+# constants
+IMAGE_NAME = "uploaded.png"
+IMAGE_ADDRESS = "https://i.ytimg.com/vi/bEwCA_nrY5Q/hq720.jpg?sqp=-oaymwEhCK4FEIIDSFryq4qpAxMIARUAAAAAGAElAADIQj0AgKJD&rs=AOn4CLB4y6YJGxw6oVxFm-Uucbrjfqhu2Q"
+PRED_IMAGE_PATH = "runs/detect/predict/uploaded.png"
+DIRECTORY = "runs/detect/predict"
+PRED_MOVE_NAME = "pred_image.png"
 
-    def recv(self, frame):
-        # frame: av.VideoFrame -> numpy (BGR)
-        img = frame.to_ndarray(format="bgr24")
+# load the yolo model
+yolo_model = load_yolo_model()
 
-        # run inference (Ultralytics models accept numpy arrays)
-        results = self.model.predict(img, conf=0.5, verbose=False)
+def make_predictions(image_path):
+    results = yolo_model.predict(image_path, save = True, conf = 0.5)
+    try:
+        if os.path.exists(PRED_IMAGE_PATH):
+            shutil.move(PRED_IMAGE_PATH, PRED_MOVE_NAME)
+            os.rmdir(DIRECTORY)
 
-        # draw boxes on img
-        for r in results:
-            for box in r.boxes:
-                x1,y1,x2,y2 = box.xyxy[0].int().tolist()
-                cls = int(box.cls[0])
-                conf = float(box.conf[0])
-                label = f"{r.names[cls]} {conf:.2f}"
-                # simple rectangle/label (OpenCV)
-                import cv2
-                cv2.rectangle(img, (x1,y1), (x2,y2), (0,255,0), 2)
-                cv2.putText(img, label, (x1, max(0,y1-5)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+            return True
+        else:
+            return False
+    except Exception as error:
+        print(str(error))
 
-        # return to browser
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+        return False
 
-st.title("Live Cockroach Detection")
-webrtc_streamer(
-    key="live",
-    video_transformer_factory=YOLOTransformer,
-    media_stream_constraints={"video": True, "audio": False},
-)
+
+# UI
+st.title("Cockroach Detection")
+st.image(IMAGE_ADDRESS, caption = "Cockroach Detection")
+
+# File uploader widget
+uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
+
+# Check if a file has been uploaded
+if uploaded_file is not None:
+    # Open the uploaded file using PIL
+    image = Image.open(uploaded_file)
+
+    # Display the image
+    image.save(IMAGE_NAME)
+
+    # get predictions
+    with st.spinner("Getting Predictions......"):
+        mask_response = make_predictions(IMAGE_NAME)
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("Original Image")
+            st.image(image)
+
+        with col2:
+            st.subheader("Detections")
+            if mask_response:
+                st.image(PRED_MOVE_NAME)
+            else:
+                st.error("Error Getting Predictions", icon="🚨")
