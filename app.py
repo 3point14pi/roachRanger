@@ -9,7 +9,7 @@ st.set_page_config(page_title="Live Cockroach Detection", layout="wide")
 st.title("🐞 Live Cockroach Detection")
 
 conf = st.sidebar.slider("Confidence threshold", 0.1, 0.95, 0.5, 0.05)
-imgsz = st.sidebar.selectbox("Image size", [320, 480, 640, 800], index=2)
+imgsz = st.sidebar.selectbox("Image size", [160, 240, 640, 800], index=2)
 
 class YOLOProcessor(VideoProcessorBase):
     def __init__(self):
