@@ -1,7 +1,12 @@
+# model_utils.py
+import os
 from ultralytics import YOLO
-import streamlit as st
-model_name = "cockroach_detection.pt"
 
-@st.cache_resource
-def load_yolo_model(image_path = model_name):
-  return YOLO(image_path)
+_model = None
+
+def load_yolo_model():
+    global _model
+    if _model is None:
+        weights = os.getenv("YOLO_MODEL_PATH", "cockroach_detection.pt")
+        _model = YOLO(weights)
+    return _model
