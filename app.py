@@ -1,56 +1,42 @@
-import streamlit as st
-import cv2
-import time
-from streamlit_autorefresh import st_autorefresh
-
-# reuse your model loader
+import streamlit as st, time, cv2
+import av
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
 from model_utils import load_yolo_model
+
 yolo_model = yolo_model if 'yolo_model' in globals() else load_yolo_model()
 
-st.subheader("Live Camera (capture 1 frame every N seconds)")
+st.subheader("Live Camera via WebRTC (1 frame every N seconds)")
+interval = st.number_input("Interval (sec)", 1, 30, 5)
+conf = st.slider("Confidence", 0.1, 0.9, 0.5, 0.05)
 
-# UI controls
-colA, colB, colC = st.columns(3)
-start = colA.toggle("Start", value=False, key="live_toggle")
-interval_sec = colB.number_input("Interval (sec)", min_value=1, max_value=30, value=5, step=1)
-cam_index = colC.number_input("Camera index", min_value=0, max_value=5, value=0, step=1)
+class FrameProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.last_ts = 0.0
+        self.annotated_bgr = None
 
-# placeholders for images and status
-orig_ph = st.empty()
-det_ph  = st.empty()
-msg_ph  = st.empty()
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img_bgr = frame.to_ndarray(format="bgr24")
 
-def capture_one_frame(index:int=0):
-    cap = cv2.VideoCapture(index)
-    if not cap.isOpened():
-        return None, "Could not open camera (index {}).".format(index)
-    ok, frame_bgr = cap.read()
-    cap.release()
-    if not ok or frame_bgr is None:
-        return None, "Failed to read a frame."
-    return frame_bgr, None
+        now = time.time()
+        # Only run YOLO every `interval` seconds
+        if now - self.last_ts >= st.session_state.get("interval", 5):
+            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            results = yolo_model.predict(rgb, conf=st.session_state.get("conf", 0.5), save=False, verbose=False)
+            ann_rgb = results[0].plot()
+            self.annotated_bgr = cv2.cvtColor(ann_rgb, cv2.COLOR_RGB2BGR)
+            self.last_ts = now
 
-if start:
-    # trigger a re-run automatically every interval
-    st_autorefresh(interval=interval_sec * 1000, key="live_autorefresh")
-    # on each rerun, take exactly ONE frame, run YOLO, and display
-    frame_bgr, err = capture_one_frame(cam_index)
-    if err:
-        st.error(err, icon="🚨")
-    else:
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        with st.spinner("Detecting..."):
-            results = yolo_model.predict(frame_rgb, conf=0.5, save=False, verbose=False)
-            annotated = results[0].plot()  # RGB array
+        # Show last annotated frame; fall back to raw frame
+        out = self.annotated_bgr if self.annotated_bgr is not None else img_bgr
+        return av.VideoFrame.from_ndarray(out, format="bgr24")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            col1.caption("Original")
-            orig_ph.image(frame_rgb, use_column_width=True)
-        with col2:
-            col2.caption("Detections")
-            det_ph.image(annotated, use_column_width=True)
+# store UI values so processor can read them
+st.session_state["interval"] = int(interval)
+st.session_state["conf"] = float(conf)
 
-        msg_ph.success(f"Captured at {time.strftime('%H:%M:%S')}")
-else:
-    st.info("Toggle ‘Start’ to begin sampling a single frame every few seconds.")
+webrtc_streamer(
+    key="live-webrtc",
+    mode=WebRtcMode.SENDRECV,
+    media_stream_constraints={"video": True, "audio": False},
+    video_processor_factory=FrameProcessor,
+)
