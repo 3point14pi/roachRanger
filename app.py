@@ -1,131 +1,64 @@
+# --- Add this to your Streamlit app (same file) ---
 import streamlit as st
-from PIL import Image
+import cv2
 import numpy as np
-from pathlib import Path
+import time
+
+# reuse your existing model loader
 from model_utils import load_yolo_model
-import tempfile
-import shutil
-import os
-import io
-import mimetypes
+yolo_model = yolo_model if 'yolo_model' in globals() else load_yolo_model()
 
-# ---------- constants ----------
-IMAGE_ADDRESS = "https://i.ytimg.com/vi/bEwCA_nrY5Q/hq720.jpg?sqp=-oaymwEhCK4FEIIDSFryq4qpAxMIARUAAAAAGAElAADIQj0AgKJD&rs=AOn4CLB4y6YJGxw6oVxFm-Uucbrjfqhu2Q"
-ALLOWED_IMG = ["jpg", "jpeg", "png"]
-ALLOWED_VID = ["mp4", "mov", "avi", "mkv", "webm"]
+st.subheader("Live Camera (1 frame every 5 seconds)")
 
-# ---------- load model once ----------
-yolo_model = load_yolo_model()
+# Controls
+colA, colB = st.columns(2)
+start = colA.toggle("Start live capture", value=False, key="live_toggle")
+interval_sec = colB.number_input("Interval (seconds)", min_value=1, max_value=30, value=5, step=1)
 
-def save_upload_to_disk(uploaded_file) -> Path:
-    """
-    Save an uploaded file to a NamedTemporaryFile and return the path.
-    Preserves the file extension so Ultralytics can infer type.
-    """
-    suffix = Path(uploaded_file.name).suffix
-    if not suffix:
-        # fall back to mime if no suffix
-        guessed = mimetypes.guess_extension(uploaded_file.type or "")
-        suffix = guessed or ""
+# This placeholder will show the latest annotated frame
+frame_placeholder = st.empty()
+status_placeholder = st.empty()
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.write(uploaded_file.read())
-    tmp.flush()
-    tmp.close()
-    return Path(tmp.name)
+# Use autorefresh to trigger a rerun every N ms while running
+if start:
+    # Autorefresh triggers a rerun every `interval_sec` seconds
+    st.autorefresh(interval=interval_sec * 1000, key="live_autorefresh", limit=None)
 
-def run_yolo_and_get_outputs(input_path: Path, conf: float = 0.5, is_video: bool = False):
-    """
-    Run yolo_model on a path (image or video). Returns:
-    - save_dir: Path to Ultralytics save directory (runs/detect/predictX)
-    - outputs: list[Path] of files written there (images or a video)
-    """
-    # For video, consider skipping frames for speed
-    kwargs = dict(save=True, conf=conf)
-    if is_video:
-        # vid_stride=2 means process every 2nd frame. Increase for more speed, less accuracy.
-        kwargs["vid_stride"] = 2
-
-    results = yolo_model.predict(str(input_path), **kwargs)
-    save_dir = Path(results[0].save_dir)
-    outputs = sorted([p for p in save_dir.glob("*") if p.is_file()])
-    return save_dir, outputs
-
-def is_image_file(name: str) -> bool:
-    return Path(name).suffix.lower().lstrip(".") in ALLOWED_IMG
-
-def is_video_file(name: str) -> bool:
-    return Path(name).suffix.lower().lstrip(".") in ALLOWED_VID
-
-# ---------- UI ----------
-st.title("Cockroach Detection")
-st.image(IMAGE_ADDRESS, caption="Cockroach Detection")
-
-uploaded = st.file_uploader(
-    "Upload an image or a video...",
-    type=ALLOWED_IMG + ALLOWED_VID
-)
-
-if uploaded is not None:
-    filename = uploaded.name
-    ext = Path(filename).suffix.lower().lstrip(".")
-
-    # Branch by type
-    if is_image_file(filename):
-        # Show and save image
-        image = Image.open(uploaded).convert("RGB")
-        st.subheader("Original Image")
-        st.image(image, use_column_width=True)
-
-        # Persist the image to disk for YOLO
-        tmp_img_path = Path(tempfile.gettempdir()) / f"uploaded_image.{ext}"
-        image.save(tmp_img_path)
-
-        with st.spinner("Running detection on image..."):
-            save_dir, outputs = run_yolo_and_get_outputs(tmp_img_path, conf=0.5, is_video=False)
-
-        # Find the annotated output image
-        # Ultralytics typically writes an output with the same basename
-        pred_img = None
-        for p in outputs:
-            if p.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-                pred_img = p
-                break
-
-        st.subheader("Detections")
-        if pred_img and pred_img.exists():
-            st.image(str(pred_img), use_column_width=True)
-        else:
-            st.error("Could not locate predicted image output.", icon="🚨")
-
-    elif is_video_file(filename):
-        # Save raw bytes to disk (don’t try PIL)
-        tmp_vid_path = save_upload_to_disk(uploaded)
-
-        st.subheader("Original Video")
-        st.video(str(tmp_vid_path))
-
-        with st.spinner("Running detection on video (this may take a bit)..."):
-            save_dir, outputs = run_yolo_and_get_outputs(tmp_vid_path, conf=0.5, is_video=True)
-
-        # Look for an output video in save_dir
-        pred_video = None
-        for p in outputs:
-            if p.suffix.lower() in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
-                pred_video = p
-                break
-
-        st.subheader("Detections (Annotated Video)")
-        if pred_video and pred_video.exists():
-            st.video(str(pred_video))
-            st.caption(f"Saved outputs in: {save_dir}")
-        else:
-            st.error("Could not locate predicted video output.", icon="🚨")
-
-        # Optional light cleanup of temp upload
-        try:
-            tmp_vid_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+    # Capture exactly ONE frame per rerun
+    cap = cv2.VideoCapture(0)  # 0 = default webcam
+    if not cap.isOpened():
+        st.error("Could not open camera. Check permissions or try a different device index.", icon="🚨")
     else:
-        st.error("Unsupported file type. Please upload an image (jpg/png) or a video (mp4/mov/avi/mkv/webm).")
+        ok, frame_bgr = cap.read()
+        cap.release()
+
+        if not ok or frame_bgr is None:
+            st.error("Failed to read a frame from the camera.", icon="🚨")
+        else:
+            # Convert BGR (OpenCV) -> RGB (YOLO/Plot convenience)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+            # Run YOLO on the single frame; no files saved
+            with st.spinner("Detecting..."):
+                results = yolo_model.predict(
+                    source=frame_rgb,  # numpy array input
+                    conf=0.5,
+                    verbose=False,
+                    save=False
+                )
+                # Annotated image as numpy array
+                annotated = results[0].plot()  # RGB array
+
+            # Show original + annotated side-by-side
+            c1, c2 = st.columns(2)
+            with c1:
+                st.caption("Original frame")
+                frame_placeholder.image(frame_rgb, use_column_width=True)
+            with c2:
+                st.caption("Detections")
+                st.image(annotated, use_column_width=True)
+
+            status_placeholder.success(f"Captured and processed one frame at {time.strftime('%H:%M:%S')}")
+
+else:
+    st.info("Toggle ‘Start live capture’ to begin sampling one frame every few seconds.")
