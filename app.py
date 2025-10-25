@@ -1,31 +1,32 @@
 # app.py
 import time
+import threading
 import cv2
 import av
+import numpy as np
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
+
+# Your own util; must return a preloaded ultralytics YOLO model
 from model_utils import load_yolo_model
 
-# ── Page setup ─────────────────────────────────────────────────────────────────
+# ───────────────── Page setup ─────────────────
 st.set_page_config(page_title="Live Cockroach Detection", layout="wide")
 st.title("🐞 Live Cockroach Detection (WebRTC + YOLO)")
 
-# ── Sidebar controls ───────────────────────────────────────────────────────────
+# ──────── Sidebar controls ────────
 st.sidebar.header("Controls")
 
-# Quality vs speed master switch
 hq = st.sidebar.toggle("High-Quality mode (GPU recommended)", value=False)
 
-# Capture / preview
 preview_width = st.sidebar.slider("Preview width (%)", 30, 100, 60, 5)
 req_fps = st.sidebar.selectbox("Requested camera FPS", [15, 24, 30, 60], index=2)
 
-# Inference settings
 if hq:
     conf = st.sidebar.slider("Confidence", 0.10, 0.95, 0.50, 0.05)
     imgsz = st.sidebar.selectbox("Inference size (px)", [480, 640, 800], index=1)
     resize_factor = 1.0  # no pre-resize in HQ
-    draw_mode = st.sidebar.selectbox("Drawing", ["Ultralytics .plot()", "Fast boxes"], index=0)
+    draw_mode = st.sidebar.selectbox("Drawing", ["Fast boxes", "Ultralytics .plot()"], index=0)
 else:
     conf = st.sidebar.slider("Confidence", 0.10, 0.95, 0.60, 0.05)
     imgsz = st.sidebar.selectbox("Inference size (px)", [320, 480, 640], index=1)
@@ -33,96 +34,159 @@ else:
     draw_mode = st.sidebar.selectbox("Drawing", ["Fast boxes", "Ultralytics .plot()"], index=0)
 
 show_fps = st.sidebar.toggle("Show FPS overlay", True)
-apply_filters = st.sidebar.toggle("Denoise + sharpen (visual)", value=hq)
 
 st.sidebar.caption(
-    "Tip: Smaller imgsz / higher conf / pre-resize ↑ = faster FPS. "
-    "High-Quality mode requests HD capture and disables pre-resize."
+    "Speed tips: pick Fast boxes, smaller imgsz (320/480), pre-resize ~0.5–0.75, and higher conf."
 )
 
 # Keep OpenCV threads sane on small CPUs
 try:
     cv2.setNumThreads(1)
+    cv2.setUseOptimized(True)
 except Exception:
     pass
 
-# ── Fast / pretty drawing helpers ─────────────────────────────────────────────
-def fast_draw(img_bgr, boxes):
-    """Minimal, fast rectangle draw without labels."""
-    if boxes is None or len(boxes) == 0:
-        return img_bgr
-    for b in boxes:
-        x1, y1, x2, y2 = map(int, b.xyxy[0])
-        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), (50, 220, 50), 2, lineType=cv2.LINE_AA)
-    return img_bgr
 
-def pretty_filters(img_bgr):
-    """Light denoise + unsharp + mild contrast for a cleaner preview (optional)."""
-    img = cv2.fastNlMeansDenoisingColored(img_bgr, None, 3, 3, 7, 21)
-    blur = cv2.GaussianBlur(img, (0, 0), 1.0)
-    img = cv2.addWeighted(img, 1.25, blur, -0.25, 0)
-    img = cv2.convertScaleAbs(img, alpha=1.08, beta=4)
-    return img
-
-# ── Video processor ───────────────────────────────────────────────────────────
+# ───────────── Video processor ─────────────
 class YOLOProcessor(VideoProcessorBase):
-    def __init__(self, init_conf, init_imgsz, init_resize, init_draw, show_fps, use_filters, hq):
+    def __init__(self, init_conf, init_imgsz, init_resize, init_draw, show_fps, hq):
+        # Load once
         self.model = load_yolo_model()
 
-        # Try to use GPU + half precision when possible
+        # Device / half / fuse
         self.device = "cpu"
         self.use_half = False
         try:
             import torch
+            self.torch = torch
             if torch.cuda.is_available():
                 self.model.to("cuda")
                 torch.backends.cudnn.benchmark = True
-                self.device = 0  # CUDA device 0
-                self.use_half = True
+                self.device = 0
+                # fuse conv+bn for speed; harmless if already fused
+                try:
+                    self.model.fuse()
+                except Exception:
+                    pass
+                # half precision if supported
+                try:
+                    self.model.model.half()
+                    self.use_half = True
+                except Exception:
+                    self.use_half = False
+            else:
+                self.torch = torch
         except Exception:
-            pass
+            self.torch = None  # ultralytics still uses torch; this is mostly defensive
 
-        # Runtime state (updated live from sidebar)
-        self.conf = init_conf
+        # Runtime state
+        self.conf = float(init_conf)
         self.imgsz = int(init_imgsz)
         self.resize_factor = float(init_resize)
         self.draw_mode = init_draw
         self.show_fps = bool(show_fps)
-        self.use_filters = bool(use_filters)
         self.hq = bool(hq)
 
         # FPS meter
         self._t0, self._cnt, self._fps = time.time(), 0, 0.0
 
-    def recv(self, frame):
-        img_bgr = frame.to_ndarray(format="bgr24")
+        # Async inference state
+        self._lock = threading.Lock()
+        self._last_boxes = None
+        self._infer_busy = False
+        # infer every Nth frame (tune); 2 for std, 1 for HQ
+        self._frame_skip = 1 if self.hq else 2
+        self._frame_id = 0
 
-        # Visual filters (do not affect detection; preview clarity only)
-        if self.use_filters:
-            img_bgr = pretty_filters(img_bgr)
+    def _rescale_boxes(self, boxes, fx, fy):
+        """Rescale xyxy in-place from resized image back to original frame."""
+        if boxes is None or len(boxes) == 0 or (fx == 1.0 and fy == 1.0):
+            return boxes
+        # boxes.xyxy is an Nx4 tensor; do it safely without extra allocs
+        try:
+            xyxy = boxes.xyxy
+            xyxy[:, [0, 2]] = xyxy[:, [0, 2]] / fx
+            xyxy[:, [1, 3]] = xyxy[:, [1, 3]] / fy
+        except Exception:
+            pass
+        return boxes
 
-        # Optional pre-resize BEFORE inference (skipped in HQ)
+    def _draw_fast(self, img_bgr, boxes):
+        """Minimal, fast rectangle draw without labels."""
+        if boxes is None or len(boxes) == 0:
+            return img_bgr
+        # Iterate once; avoid per-box heavy effects
+        for b in boxes:
+            x1, y1, x2, y2 = map(int, b.xyxy[0])
+            cv2.rectangle(img_bgr, (x1, y1), (x2, y2), (50, 220, 50), 2, lineType=cv2.LINE_AA)
+        return img_bgr
+
+    def _predict_one(self, img_bgr):
+        # Optional pre-resize BEFORE inference
         if 0.4 <= self.resize_factor < 1.0:
-            img_bgr = cv2.resize(img_bgr, (0, 0),
-                                 fx=self.resize_factor, fy=self.resize_factor,
-                                 interpolation=cv2.INTER_AREA)
+            img_in = cv2.resize(
+                img_bgr, (0, 0),
+                fx=self.resize_factor, fy=self.resize_factor,
+                interpolation=cv2.INTER_AREA
+            )
+            fx = fy = self.resize_factor
+        else:
+            img_in = img_bgr
+            fx = fy = 1.0
 
-        # Inference
-        results = self.model.predict(
-            img_bgr,
+        # Inference (no grad)
+        kwargs = dict(
             conf=self.conf,
             imgsz=self.imgsz,
-            device=self.device if self.device != "cpu" else None,
-            half=self.use_half,
             verbose=False,
         )
-        r = results[0]
+        if self.device != "cpu":
+            kwargs["device"] = self.device
+            kwargs["half"] = self.use_half
 
-        # Draw
+        results = self.model.predict(img_in, **kwargs)
+        r = results[0]
+        boxes = r.boxes
+
+        # Rescale boxes back to original frame space if we resized input
+        self._rescale_boxes(boxes, fx, fy)
+
+        # Cache
+        with self._lock:
+            self._last_boxes = boxes
+
+    def _maybe_start_infer(self, frame_bgr):
+        if self._infer_busy:
+            return
+        self._infer_busy = True
+
+        def _task(img_copy):
+            try:
+                self._predict_one(img_copy)
+            finally:
+                self._infer_busy = False
+
+        # Use a daemon thread; drop late frames by always using the latest image copy
+        threading.Thread(target=_task, args=(frame_bgr.copy(),), daemon=True).start()
+
+    def recv(self, frame):
+        img_bgr = frame.to_ndarray(format="bgr24")
+        self._frame_id += 1
+
+        # Start async inference every Nth frame
+        if (self._frame_id % self._frame_skip) == 0:
+            self._maybe_start_infer(img_bgr)
+
+        # Draw using last available detections (may be 1–2 frames old)
+        with self._lock:
+            boxes = self._last_boxes
+
         if self.draw_mode.startswith("Ultra"):
-            out = r.plot(line_width=3, labels=True, conf=True)  # prettier, a bit slower
+            # Avoid re-running Ultralytics .plot() (it would re-infer).
+            # Keep fast draw for speed.
+            out = self._draw_fast(img_bgr.copy(), boxes)
         else:
-            out = fast_draw(img_bgr.copy(), r.boxes)
+            out = self._draw_fast(img_bgr.copy(), boxes)
 
         # FPS overlay
         if self.show_fps:
@@ -136,7 +200,8 @@ class YOLOProcessor(VideoProcessorBase):
 
         return av.VideoFrame.from_ndarray(out, format="bgr24")
 
-# ── Choose camera constraints based on HQ toggle ──────────────────────────────
+
+# ───────── Capture constraints ─────────
 capture_constraints = {
     "video": {
         # HQ asks for HD; Standard asks for SD-ish
@@ -148,7 +213,7 @@ capture_constraints = {
     "audio": False,
 }
 
-# ── WebRTC streamer ───────────────────────────────────────────────────────────
+# ───────── WebRTC streamer ─────────
 ctx = webrtc_streamer(
     key="yolo-live",
     mode=WebRtcMode.SENDRECV,
@@ -159,10 +224,9 @@ ctx = webrtc_streamer(
         init_resize=resize_factor,
         init_draw=draw_mode,
         show_fps=show_fps,
-        use_filters=apply_filters,
         hq=hq,
     ),
-    async_processing=True,
+    async_processing=True,  # let streamlit-webrtc pipeline run async
     video_html_attrs={
         "style": {"width": f"{preview_width}%", "margin": "auto"},
         "controls": False,
@@ -175,9 +239,8 @@ ctx = webrtc_streamer(
 # Live-update processor from sidebar
 if ctx and ctx.video_processor:
     vp = ctx.video_processor
-    vp.conf = conf
+    vp.conf = float(conf)
     vp.imgsz = int(imgsz)
     vp.resize_factor = float(resize_factor)
     vp.draw_mode = draw_mode
     vp.show_fps = bool(show_fps)
-    vp.use_filters = bool(apply_filters)
