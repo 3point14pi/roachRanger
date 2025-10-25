@@ -208,7 +208,7 @@ capture_constraints = {
         "width":  {"ideal": 1280, "min": 960} if hq else {"ideal": 640},
         "height": {"ideal": 720,  "min": 540} if hq else {"ideal": 480},
         "frameRate": {"ideal": int(req_fps), "max": 60},
-        # "facingMode": {"ideal": "environment"},  # uncomment for rear cam on mobile
+        "facingMode": {"ideal": "environment"},
     },
     "audio": False,
 }
