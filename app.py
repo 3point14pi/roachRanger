@@ -174,19 +174,63 @@ class YOLOProcessor(VideoProcessorBase):
         xyxy[:, [1, 3]] = xyxy[:, [1, 3]] / fy
         return boxes
 
+    # ---------- CHANGED: robust extraction, same signature ----------
     def _boxes_to_int_xyxy_and_labels(self, boxes, names):
-        xyxy_list, labels = [], []
+        """
+        Robustly convert Ultralytics Boxes -> (list[int xyxy], list[str|None] labels).
+        Keeps the same signature and return type as your original function.
+        """
         if boxes is None or len(boxes) == 0:
-            return xyxy_list, labels
-        for i in range(len(boxes)):
-            b = boxes[i]
-            x1, y1, x2, y2 = map(int, b.xyxy[0])
-            cls = int(b.cls[0]) if b.cls is not None else -1
-            conf = float(b.conf[0]) if b.conf is not None else 0.0
-            lab = f"{names[cls]} {conf:.2f}" if (cls >= 0 and names and self.draw_labels) else None
-            xyxy_list.append((x1, y1, x2, y2))
-            labels.append(lab)
-        return xyxy_list, labels
+            return [], []
+
+        # Get tensors/arrays
+        xyxy = getattr(boxes, "xyxy", None)
+        cls = getattr(boxes, "cls", None)
+        conf = getattr(boxes, "conf", None)
+
+        if xyxy is None:
+            return [], []
+
+        # to numpy safely
+        try:
+            xyxy_np = xyxy.detach().cpu().numpy() if hasattr(xyxy, "detach") else np.array(xyxy)
+        except Exception:
+            return [], []
+
+        out_boxes, out_labels = [], []
+        n = xyxy_np.shape[0]
+
+        # Normalize names (support dict or list)
+        norm_names = names
+        if isinstance(norm_names, dict):
+            try:
+                max_k = max(norm_names.keys())
+                if all(k in norm_names for k in range(max_k + 1)):
+                    norm_names = [norm_names[k] for k in range(max_k + 1)]
+            except Exception:
+                pass
+
+        for i in range(n):
+            x1, y1, x2, y2 = map(int, xyxy_np[i].tolist())
+            out_boxes.append((x1, y1, x2, y2))
+
+            label = None
+            if self.draw_labels and cls is not None and conf is not None:
+                try:
+                    c = int(cls[i].item() if hasattr(cls[i], "item") else cls[i])
+                    p = float(conf[i].item() if hasattr(conf[i], "item") else conf[i])
+                    if isinstance(norm_names, (list, tuple)) and 0 <= c < len(norm_names):
+                        label = f"{norm_names[c]} {p:.2f}"
+                    elif isinstance(norm_names, dict) and c in norm_names:
+                        label = f"{norm_names[c]} {p:.2f}"
+                    else:
+                        label = f"id{c} {p:.2f}"
+                except Exception:
+                    label = None
+            out_labels.append(label)
+
+        return out_boxes, out_labels
+    # ---------- end change ----------
 
     def _(self):
         # niche trick to avoid accidental name shadowing in some REPLs
@@ -226,6 +270,7 @@ class YOLOProcessor(VideoProcessorBase):
         self._track_labels = alive_labels
         return boxes_xyxy, alive_labels
 
+    # ---------- CHANGED: names access only; rest same ----------
     def _predict_once(self, img_bgr):
         # Optional pre-resize for inference only
         if 0.4 <= self.resize_factor < 1.0:
@@ -248,31 +293,15 @@ class YOLOProcessor(VideoProcessorBase):
 
         r = results[0]
         boxes = r.boxes
-        names = getattr(getattr(self.model, "names", None), "values", None) or getattr(self.model, "names", None)
 
+        # Use the model's names directly (handles dict or list)
+        names = getattr(self.model, "names", None)
+
+        # Keep your original rescale path
         self._rescale_boxes_inplace(boxes, fx, fy)
         boxes_xyxy, labels = self._boxes_to_int_xyxy_and_labels(boxes, names)
         return boxes_xyxy, labels
-
-    def _maybe_start_infer(self, img_bgr):
-        if self._infer_busy:
-            return
-        self._infer_busy = True
-
-        def _task(frame_copy):
-            try:
-                boxes_xyxy, labels = self._predict_once(frame_copy)
-                with self._lock:
-                    self._last_boxes_xyxy = boxes_xyxy
-                    self._last_labels = labels
-                # Rebuild trackers on each fresh detection
-                self._start_trackers(frame_copy, boxes_xyxy, labels)
-                # Adapt cadence to match hardware
-                self._adapt_frame_skip()
-            finally:
-                self._infer_busy = False
-
-        threading.Thread(target=_task, args=(img_bgr.copy(),), daemon=True).start()
+    # ---------- end change ----------
 
     # ───────────── main callback ─────────────
     def recv(self, frame):
