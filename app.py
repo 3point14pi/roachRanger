@@ -1,4 +1,15 @@
-# app.py
+# app.py — Live Cockroach Detection (WebRTC + YOLO) — fixed det~0.0fps + smarter skip
+# -----------------------------------------------------------------------------
+# Key fixes:
+#  • One-time warmup inference to avoid first-call 0.0 FPS
+#  • EMA smoothing of detection FPS (no more sticky 0.0)
+#  • Smarter adaptive frame skipping (1–8) based on measured det time
+#  • Optional pre-resize for inference; small default imgsz on CPU
+#  • Back-camera selection on mobile via facingMode
+#  • CPU thread limiting for OpenCV and PyTorch
+#  • Robust trackers to keep high box refresh rate between detections
+# -----------------------------------------------------------------------------
+
 import time
 import threading
 from typing import List, Tuple
@@ -35,7 +46,7 @@ if hq:
     resize_factor = 1.0  # no pre-resize in HQ
 else:
     conf = st.sidebar.slider("Confidence", 0.10, 0.95, 0.65, 0.05)
-    imgsz = st.sidebar.selectbox("Inference size (px)", [320, 480, 640], index=1)
+    imgsz = st.sidebar.selectbox("Inference size (px)", [320, 480, 640], index=0)
     resize_factor = st.sidebar.slider("Pre-resize input (fx/fy)", 0.4, 1.0, 0.7, 0.05)
 
 show_fps = st.sidebar.toggle("Show FPS overlay", True)
@@ -55,6 +66,7 @@ except Exception:
 # ───────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ───────────────────────────────────────────────────────────────────────────────
+
 def _make_tracker():
     # Prefer KCF → CSRT → MOSSE (fastest). Availability varies by build.
     if hasattr(cv2, "TrackerKCF_create"):
@@ -95,11 +107,13 @@ def _clip_box(x1, y1, x2, y2, w, h):
 class YOLOProcessor(VideoProcessorBase):
     """
     Best-practice pipeline for Streamlit WebRTC:
+    - Warmup inference to avoid first-call stalls
     - Adaptive inference cadence based on measured model time & requested FPS
-    - Latest-frame dropping to prevent backpressure (no 1 FPS collapse)
+    - Latest-frame dropping to prevent backpressure
     - Optional GPU half precision + layer fusion
-    - Multi-object tracking (OpenCV) between detections for smooth box updates
+    - Multi-object tracking between detections for smooth box updates
     """
+
     def __init__(self, init_conf, init_imgsz, init_resize, show_fps, draw_labels, hq, req_fps):
         # Model
         self.model = load_yolo_model()
@@ -114,9 +128,17 @@ class YOLOProcessor(VideoProcessorBase):
         # Device / half / fuse
         self.device = "cpu"
         self.use_half = False
+        self._ema_det = None  # EMA of det time
+
         try:
             import torch
             self.torch = torch
+            # Limit CPU threads on small boxes
+            try:
+                self.torch.set_num_threads(1)
+            except Exception:
+                pass
+
             if torch.cuda.is_available():
                 self.model.to("cuda")
                 torch.backends.cudnn.benchmark = True
@@ -126,12 +148,12 @@ class YOLOProcessor(VideoProcessorBase):
                 except Exception:
                     pass
                 try:
-                    self.model.model.half()
-                    self.use_half = True
+                    # Not all wrappers expose .model.half(); ignore if missing
+                    if hasattr(self.model, "model") and hasattr(self.model.model, "half"):
+                        self.model.model.half()
+                        self.use_half = True
                 except Exception:
                     self.use_half = False
-            else:
-                self.torch = torch
         except Exception:
             self.torch = None
 
@@ -140,7 +162,7 @@ class YOLOProcessor(VideoProcessorBase):
         self._infer_busy = False
         self._last_det_time = 0.05  # seconds; seed ~20 FPS
         self._target_det_fps = 20 if self.use_half else (12 if self.hq else 10)
-        self._frame_skip = 1  # will adapt on the fly
+        self._frame_skip = 2  # start slightly conservative
         self._frame_id = 0
 
         # Last detections (xyxy, labels)
@@ -154,17 +176,28 @@ class YOLOProcessor(VideoProcessorBase):
         # FPS meter (render)
         self._t0, self._cnt, self._fps = time.time(), 0, 0.0
 
+        # One-time warmup to avoid det~0.0 due to first-call latency
+        try:
+            dummy = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
+            kwargs = dict(conf=self.conf, imgsz=self.imgsz, verbose=False)
+            if self.device != "cpu":
+                kwargs["device"] = self.device
+                kwargs["half"] = self.use_half
+            _ = self.model.predict(dummy, **kwargs)
+            self._last_det_time = 0.05
+            self._ema_det = self._last_det_time
+        except Exception:
+            # If warmup fails, keep defaults; first live call will set times
+            pass
+
     def _adapt_frame_skip(self):
         """Adapt how often we run YOLO to reach target detection FPS."""
-        if self.req_fps <= 0:
-            self._frame_skip = 1
-            return
-        # If detections take longer, increase skip; shorter → reduce skip
-        # aim: det_fps ~= target_det_fps
-        est_det_fps = 1.0 / max(self._last_det_time, 1e-6)
-        ratio = max(0.5, min(2.0, self._target_det_fps / max(1e-6, est_det_fps)))
-        desired_det_every = max(1, int(round(self.req_fps / max(1.0, self._target_det_fps * ratio))))
-        self._frame_skip = max(1, desired_det_every)
+        # Backoff more aggressively on weak hardware; cap skip to keep UX
+        det_time = max(self._last_det_time, 1e-3)
+        target_dt = 0.12 if self.hq else 0.14  # ~8–7 det/s targets
+        # Desired number of frames to wait between detections based on timing
+        desired = int(round((det_time / target_dt) * max(1, self.req_fps or 15)))
+        self._frame_skip = int(max(1, min(8, desired)))
 
     def _rescale_boxes_inplace(self, boxes, fx, fy):
         if boxes is None or len(boxes) == 0 or (fx == 1.0 and fy == 1.0):
@@ -244,7 +277,10 @@ class YOLOProcessor(VideoProcessorBase):
 
         t0 = time.time()
         results = self.model.predict(img_in, **kwargs)
-        self._last_det_time = max(1e-6, time.time() - t0)
+        dt = max(1e-6, time.time() - t0)
+        self._last_det_time = dt
+        # Update EMA of detection time (smooths meter)
+        self._ema_det = (0.9 * (self._ema_det if self._ema_det else dt)) + 0.1 * dt
 
         r = results[0]
         boxes = r.boxes
@@ -295,14 +331,17 @@ class YOLOProcessor(VideoProcessorBase):
 
         out = _draw_fast(img.copy(), boxes_xyxy, labels if self.draw_labels else None)
 
-        # FPS overlay (render FPS, not detection FPS)
+        # FPS overlay (render FPS + smoothed detection FPS)
         if self.show_fps:
             self._cnt += 1
             if self._cnt >= 15:
                 t1 = time.time()
                 self._fps = self._cnt / (t1 - self._t0)
                 self._t0, self._cnt = t1, 0
-            cv2.putText(out, f"{self._fps:.1f} FPS  det~{1.0/max(self._last_det_time,1e-6):.1f} FPS  skip:{self._frame_skip}",
+            det_fps_now = 1.0 / max(self._ema_det if self._ema_det else self._last_det_time, 1e-6)
+            warming = (self._frame_id < 45 and det_fps_now < 1.0)
+            label = "warming up…" if warming else f"det~{det_fps_now:.1f} FPS"
+            cv2.putText(out, f"{self._fps:.1f} FPS  {label}  skip:{self._frame_skip}",
                         (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         return av.VideoFrame.from_ndarray(out, format="bgr24")
