@@ -1,183 +1,261 @@
-# =========================
-# STEP 0: Installs
-# =========================
-!pip -q install ultralytics opencv-python
+# app.py
+import os
+import time
+import tempfile
+from typing import List, Tuple
 
-# =========================
-# STEP 1: Imports
-# =========================
-import os, csv, zipfile, time
 import cv2
 import numpy as np
-from google.colab import files
-from ultralytics import YOLO
+import streamlit as st
 
-# =========================
-# STEP 2: Upload video
-# =========================
-print("📤 Upload your video file")
-uploaded = files.upload()
-video_path = list(uploaded.keys())[0]
-print(f"✅ Uploaded: {video_path}")
+# Your util that returns a preloaded ultralytics YOLO model (e.g., YOLO("yolov8n.pt"))
+from model_utils import load_yolo_model
 
-# =========================
-# STEP 3: Settings
-# =========================
-# Change weights if you have your own .pt (e.g., "best.pt" or a roach model)
-WEIGHTS = "yolov8n.pt"    # small & fast default
-CONF    = 0.35            # confidence threshold
-IMGSZ   = 640             # inference size
-SAVE_FRAMES = False       # set True to also save annotated JPG frames
-FRAME_STRIDE = 1          # process every Nth frame (e.g., 2 = half speed)
+# ───────────────────────────────────────────────────────────────────────────────
+# Page
+# ───────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Video Cockroach Detection", layout="wide")
+st.title("🐞 Cockroach Detection on Uploaded Video (YOLO)")
 
-# Output paths
-stem = os.path.splitext(os.path.basename(video_path))[0]
-out_dir = f"{stem}_yolo_out"
-os.makedirs(out_dir, exist_ok=True)
-frames_dir = os.path.join(out_dir, "frames")
-if SAVE_FRAMES:
-    os.makedirs(frames_dir, exist_ok=True)
-csv_path = os.path.join(out_dir, f"{stem}_detections.csv")
-out_video_path = os.path.join(out_dir, f"{stem}_annotated.mp4")
-zip_name = f"{stem}_yolo_outputs.zip"
+st.sidebar.header("Controls")
 
-# =========================
-# STEP 4: Load model (GPU if available)
-# =========================
-model = YOLO(WEIGHTS)
-try:
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-except Exception:
-    device = "cpu"
-print(f"🧠 Using device: {device}")
+# Detection settings
+conf = st.sidebar.slider("Confidence", 0.10, 0.95, 0.50, 0.05)
+imgsz = st.sidebar.selectbox("Inference size (px)", [320, 480, 640, 800], index=2)
+draw_labels = st.sidebar.toggle("Show labels", value=True)
+resize_factor = st.sidebar.slider("Pre-resize input (fx/fy)", 0.4, 1.0, 1.0, 0.05)
 
-# =========================
-# STEP 5: Open video
-# =========================
-cap = cv2.VideoCapture(video_path)
-if not cap.isOpened():
-    raise RuntimeError("❌ Error: Could not open video.")
+# Performance
+every_n = st.sidebar.number_input("Detect every Nth frame (1 = every frame)", min_value=1, max_value=20, value=1, step=1)
 
-fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+st.sidebar.caption(
+    "Tip: Increase N to speed up processing. For example, N=2 halves detection calls."
+)
 
-# Prepare video writer (mp4v is broadly compatible in Colab)
-fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-writer = cv2.VideoWriter(out_video_path, fourcc, fps, (w, h))
+# ───────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ───────────────────────────────────────────────────────────────────────────────
+def _draw_fast(img, boxes_xyxy: List[Tuple[int, int, int, int]], labels=None):
+    if not boxes_xyxy:
+        return img
+    for i, (x1, y1, x2, y2) in enumerate(boxes_xyxy):
+        cv2.rectangle(img, (x1, y1), (x2, y2), (50, 220, 50), 2, lineType=cv2.LINE_AA)
+        if labels and i < len(labels) and labels[i]:
+            cv2.putText(img, labels[i], (x1, max(20, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    return img
 
-# CSV header
-with open(csv_path, "w", newline="") as fcsv:
-    wcsv = csv.writer(fcsv)
-    wcsv.writerow(["frame_idx", "class_id", "class_name", "confidence", "x1", "y1", "x2", "y2"])
 
-# =========================
-# STEP 6: Process loop
-# =========================
-frame_idx = 0
-kept = 0
-t0 = time.time()
+def _boxes_to_int_xyxy_and_labels(boxes, names, draw_labels_flag=True):
+    """
+    Robustly convert Ultralytics Boxes -> (list[int xyxy], list[str|None] labels).
+    Works across minor API differences (dict/list names, tensor/array internals).
+    """
+    if boxes is None or len(boxes) == 0:
+        return [], []
 
-print(f"▶️ Processing {total if total>0 else '?'} frames @ {fps:.2f} FPS, {w}x{h}")
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    xyxy = getattr(boxes, "xyxy", None)
+    cls = getattr(boxes, "cls", None)
+    conf = getattr(boxes, "conf", None)
+    if xyxy is None:
+        return [], []
 
-    # Skip frames for speed if requested
-    if FRAME_STRIDE > 1 and (frame_idx % FRAME_STRIDE) != 0:
-        frame_idx += 1
-        continue
+    # to numpy safely
+    try:
+        xyxy_np = xyxy.detach().cpu().numpy() if hasattr(xyxy, "detach") else np.array(xyxy)
+    except Exception:
+        return [], []
 
-    # Predict
-    results = model.predict(
-        frame,
-        conf=CONF,
-        imgsz=IMGSZ,
-        device=device,
-        verbose=False
-    )
+    # Normalize names (support dict or list)
+    norm_names = names
+    if isinstance(norm_names, dict):
+        try:
+            max_k = max(norm_names.keys())
+            if all(k in norm_names for k in range(max_k + 1)):
+                norm_names = [norm_names[k] for k in range(max_k + 1)]
+        except Exception:
+            pass
 
-    r = results[0]
-    boxes = getattr(r, "boxes", None)
+    out_boxes, out_labels = [], []
+    n = xyxy_np.shape[0]
+    for i in range(n):
+        x1, y1, x2, y2 = map(int, xyxy_np[i].tolist())
+        out_boxes.append((x1, y1, x2, y2))
 
-    # Draw and log
-    if boxes is not None and len(boxes) > 0:
-        # Access tensors safely
-        xyxy = boxes.xyxy
-        cls  = boxes.cls
-        conf = boxes.conf
-
-        # Normalize class names list/dict
-        names = getattr(model, "names", None)
-        if isinstance(names, dict):
+        label = None
+        if draw_labels_flag and cls is not None and conf is not None:
             try:
-                max_k = max(names.keys())
-                if all(k in names for k in range(max_k + 1)):
-                    names = [names[k] for k in range(max_k + 1)]
+                c = int(cls[i].item() if hasattr(cls[i], "item") else cls[i])
+                p = float(conf[i].item() if hasattr(conf[i], "item") else conf[i])
+                if isinstance(norm_names, (list, tuple)) and 0 <= c < len(norm_names):
+                    label = f"{norm_names[c]} {p:.2f}"
+                elif isinstance(norm_names, dict) and c in norm_names:
+                    label = f"{norm_names[c]} {p:.2f}"
+                else:
+                    label = f"id{c} {p:.2f}"
+            except Exception:
+                label = None
+        out_labels.append(label)
+
+    return out_boxes, out_labels
+
+
+def _predict_once(model, img_bgr, conf, imgsz, resize_factor, device, use_half):
+    # Optional pre-resize for inference only
+    if 0.4 <= resize_factor < 1.0:
+        img_in = cv2.resize(img_bgr, (0, 0),
+                            fx=resize_factor, fy=resize_factor,
+                            interpolation=cv2.INTER_AREA)
+        fx = fy = resize_factor
+    else:
+        img_in = img_bgr
+        fx = fy = 1.0
+
+    kwargs = dict(conf=conf, imgsz=imgsz, verbose=False)
+    if device != "cpu":
+        kwargs["device"] = device
+        if use_half:
+            kwargs["half"] = True
+
+    results = model.predict(img_in, **kwargs)
+    r = results[0]
+    boxes = r.boxes
+
+    # Undo scaling on results if we pre-resized
+    if 0.4 <= resize_factor < 1.0:
+        try:
+            if hasattr(r, "boxes") and hasattr(r.boxes, "xyxy"):
+                r.boxes.xyxy[:, [0, 2]] = r.boxes.xyxy[:, [0, 2]] / fx
+                r.boxes.xyxy[:, [1, 3]] = r.boxes.xyxy[:, [1, 3]] / fy
+        except Exception:
+            pass
+
+    names = getattr(model, "names", None)
+    boxes_xyxy, labels = _boxes_to_int_xyxy_and_labels(boxes, names, draw_labels)
+    return boxes_xyxy, labels
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Model init (GPU if available)
+# ───────────────────────────────────────────────────────────────────────────────
+device = "cpu"
+use_half = False
+torch = None
+try:
+    import torch as _torch
+    torch = _torch
+    if torch.cuda.is_available():
+        device = 0
+except Exception:
+    pass
+
+model = load_yolo_model()
+try:
+    if device != "cpu":
+        model.to("cuda")
+        if hasattr(model, "fuse"):
+            try:
+                model.fuse()
             except Exception:
                 pass
+        try:
+            # half precision speeds up on many GPUs
+            model.model.half()
+            use_half = True
+        except Exception:
+            use_half = False
+except Exception:
+    device = "cpu"
+    use_half = False
 
-        # to CPU numpy
-        xyxy_np = xyxy.detach().cpu().numpy()
-        cls_np  = cls.detach().cpu().numpy() if cls is not None else np.array([])
-        conf_np = conf.detach().cpu().numpy() if conf is not None else np.array([])
+# ───────────────────────────────────────────────────────────────────────────────
+# Uploader
+# ───────────────────────────────────────────────────────────────────────────────
+uploaded = st.file_uploader("Upload a video (mp4/mov/avi/mkv)", type=["mp4", "mov", "avi", "mkv"])
 
-        # Draw
-        for i in range(xyxy_np.shape[0]):
-            x1, y1, x2, y2 = map(int, xyxy_np[i].tolist())
-            c  = int(cls_np[i]) if i < len(cls_np) else -1
-            p  = float(conf_np[i]) if i < len(conf_np) else 0.0
-            label = None
-            if isinstance(names, (list, tuple)) and 0 <= c < len(names):
-                label = f"{names[c]} {p:.2f}"
-            elif isinstance(names, dict) and c in names:
-                label = f"{names[c]} {p:.2f}"
+if uploaded is not None:
+    # Save to a temp file so OpenCV can read it
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded.name}") as tmp_in:
+        tmp_in.write(uploaded.read())
+        input_path = tmp_in.name
+
+    # Prepare output path
+    out_path = os.path.join(tempfile.gettempdir(), f"annotated_{int(time.time())}.mp4")
+
+    # Open input
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        st.error("Could not open the uploaded video.")
+    else:
+        in_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        if np.isnan(in_fps) or in_fps <= 0:
+            in_fps = 30.0
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
+
+        # Writer (mp4v widely supported)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(out_path, fourcc, in_fps, (w, h))
+
+        # UI
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        prog = st.progress(0 if total_frames > 0 else 0)
+        status = st.empty()
+
+        last_boxes, last_labels = [], []
+        frame_idx = 0
+        t0 = time.time()
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            do_detect = (frame_idx % every_n == 0)
+
+            if do_detect:
+                boxes, labels = _predict_once(
+                    model=model,
+                    img_bgr=frame,
+                    conf=conf,
+                    imgsz=imgsz,
+                    resize_factor=resize_factor,
+                    device=device,
+                    use_half=use_half,
+                )
+                last_boxes, last_labels = boxes, labels
             else:
-                label = f"id{c} {p:.2f}"
+                boxes, labels = last_boxes, last_labels
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (50, 220, 50), 2, lineType=cv2.LINE_AA)
-            cv2.putText(frame, label, (x1, max(20, y1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+            # Overlay debug count
+            cv2.putText(frame, f"det_cnt:{len(boxes)}", (8, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # write to CSV
-            with open(csv_path, "a", newline="") as fcsv:
-                wcsv = csv.writer(fcsv)
-                wcsv.writerow([frame_idx, c, label.split()[0] if label else "", f"{p:.4f}", x1, y1, x2, y2])
+            # Draw
+            annotated = _draw_fast(frame, boxes, labels if draw_labels else None)
+            writer.write(annotated)
 
-    # Save annotated frame to video
-    writer.write(frame)
-    kept += 1
+            # Progress
+            frame_idx += 1
+            if total_frames > 0:
+                prog.progress(min(1.0, frame_idx / total_frames))
+                if frame_idx % max(1, total_frames // 50) == 0:
+                    elapsed = time.time() - t0
+                    status.text(f"Processing frame {frame_idx}/{total_frames} • elapsed {elapsed:.1f}s")
 
-    # Optional: save individual frames
-    if SAVE_FRAMES:
-        cv2.imwrite(os.path.join(frames_dir, f"frame_{frame_idx:05d}.jpg"), frame)
+        cap.release()
+        writer.release()
 
-    if frame_idx % 50 == 0:
-        elapsed = time.time() - t0
-        print(f"Processed {frame_idx} frames... ({elapsed:.1f}s)")
-    frame_idx += 1
+        st.success("Done! Preview below 👇")
+        st.video(out_path)
 
-cap.release()
-writer.release()
+        with open(out_path, "rb") as f:
+            st.download_button("Download annotated video", data=f, file_name="annotated.mp4", mime="video/mp4")
 
-print(f"✅ Done! Wrote {kept} processed frames to video: {out_video_path}")
-
-# =========================
-# STEP 7: Zip & download
-# =========================
-with zipfile.ZipFile(zip_name, 'w') as zipf:
-    # video
-    zipf.write(out_video_path)
-    # CSV
-    zipf.write(csv_path)
-    # frames (optional)
-    if SAVE_FRAMES:
-        for root, _, files_list in os.walk(frames_dir):
-            for fn in files_list:
-                zipf.write(os.path.join(root, fn))
-
-print(f"📦 Zipped outputs into {zip_name}")
-files.download(zip_name)
+        # Cleanup input (keep output so user can download)
+        try:
+            os.remove(input_path)
+        except Exception:
+            pass
+else:
+    st.info("Upload a video file to start.")
